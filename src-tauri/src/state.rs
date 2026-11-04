@@ -2,7 +2,7 @@ use crate::discord::SpoofableGame;
 use serde::{Deserialize, Serialize};
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
-use tokio::sync::{Mutex, Notify, RwLock};
+use tokio::sync::{Mutex, RwLock};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -17,8 +17,8 @@ pub enum SpooferStatus {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum SpoofMode {
-    #[default]
     Hybrid,
+    #[default]
     ProcessOnly,
     RpcOnly,
 }
@@ -104,6 +104,8 @@ pub struct SpooferConfig {
     /// Farm mode time limit; `None` keeps the games running until stopped.
     #[serde(default)]
     pub farm_duration_secs: Option<u64>,
+    #[serde(default)]
+    pub beta_enabled: bool,
 }
 
 pub struct AppState {
@@ -111,8 +113,6 @@ pub struct AppState {
     pub status: Arc<RwLock<SpooferStatus>>,
     pub cancel_flag: Arc<AtomicBool>,
     pub pause_flag: Arc<AtomicBool>,
-    pub resume_notify: Arc<Notify>,
-    pub active_pids: Arc<Mutex<Vec<u32>>>,
     pub current_task: Arc<Mutex<Option<tokio::task::JoinHandle<()>>>>,
 }
 
@@ -123,9 +123,95 @@ impl AppState {
             status: Arc::new(RwLock::new(SpooferStatus::Idle)),
             cancel_flag: Arc::new(AtomicBool::new(false)),
             pause_flag: Arc::new(AtomicBool::new(false)),
-            resume_notify: Arc::new(Notify::new()),
-            active_pids: Arc::new(Mutex::new(Vec::new())),
             current_task: Arc::new(Mutex::new(None)),
         }
+    }
+}
+
+impl Default for AppState {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+impl SpooferConfig {
+    pub fn validate(&self) -> Result<(), String> {
+        if !(1..=4).contains(&self.batch_size) {
+            return Err("Выберите от 1 до 4 процессов".into());
+        }
+        if !(15..=3600).contains(&self.hold_duration_secs) {
+            return Err("Удержание: от 15 до 3600 секунд".into());
+        }
+        if self.limit.is_some_and(|n| n == 0 || n > 100_000)
+            || self.start_offset.is_some_and(|n| n > 100_000)
+        {
+            return Err("Некорректный диапазон игр".into());
+        }
+        if !(1..=100).contains(&self.cooldown_every_n_batches)
+            || !(1..=600).contains(&self.cooldown_seconds)
+        {
+            return Err("Некорректные параметры паузы".into());
+        }
+        if self.farm_game_ids.len() > 4
+            || self
+                .farm_game_ids
+                .iter()
+                .any(|id| !crate::security::valid_id(id))
+        {
+            return Err("Выберите до 4 игр".into());
+        }
+        if self
+            .farm_duration_secs
+            .is_some_and(|n| !(15..=28800).contains(&n))
+        {
+            return Err("Длительность: от 15 секунд до 8 часов".into());
+        }
+        if self.spoof_mode != SpoofMode::ProcessOnly && !self.beta_enabled {
+            return Err("RPC требует явного включения экспериментального режима".into());
+        }
+        Ok(())
+    }
+}
+#[cfg(test)]
+mod tests {
+    use super::*;
+    fn config() -> SpooferConfig {
+        serde_json::from_value(serde_json::json!({"limit":null,"batch_size":1,"hold_duration_secs":60,"start_offset":0})).unwrap()
+    }
+    #[test]
+    fn defaults_are_native() {
+        let c = config();
+        assert_eq!(c.spoof_mode, SpoofMode::ProcessOnly);
+        assert!(!c.beta_enabled);
+        assert!(c.validate().is_ok());
+    }
+    #[test]
+    fn validates_backend_limits() {
+        let mut c = config();
+        c.batch_size = 0;
+        assert!(c.validate().is_err());
+        c.batch_size = 5;
+        assert!(c.validate().is_err());
+        c.batch_size = 1;
+        c.cooldown_every_n_batches = 0;
+        assert!(c.validate().is_err());
+        c.cooldown_every_n_batches = 25;
+        c.hold_duration_secs = u64::MAX;
+        assert!(c.validate().is_err());
+    }
+    #[test]
+    fn rpc_requires_opt_in() {
+        let mut c = config();
+        c.spoof_mode = SpoofMode::RpcOnly;
+        assert!(c.validate().is_err());
+        c.beta_enabled = true;
+        assert!(c.validate().is_ok());
+    }
+    #[test]
+    fn duration_is_bounded() {
+        let mut c = config();
+        c.farm_duration_secs = Some(28801);
+        assert!(c.validate().is_err());
+        c.farm_duration_secs = Some(0);
+        assert!(c.validate().is_err());
     }
 }

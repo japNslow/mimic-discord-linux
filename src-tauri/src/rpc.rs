@@ -1,239 +1,290 @@
+use crate::security::valid_id;
 use serde_json::{json, Value};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::os::unix::fs::{FileTypeExt, MetadataExt};
+use std::path::PathBuf;
+use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-
-const OP_HANDSHAKE: u32 = 0;
-const OP_FRAME: u32 = 1;
-const OP_CLOSE: u32 = 2;
-
-#[cfg(windows)]
-use tokio::net::windows::named_pipe::ClientOptions;
-
+use tokio::net::UnixStream;
+const TIMEOUT: Duration = Duration::from_secs(2);
+const MAX_FRAME: usize = 65536;
 pub struct DiscordRpcSession {
-    #[cfg(windows)]
-    stream: tokio::net::windows::named_pipe::NamedPipeClient,
-    #[cfg(unix)]
-    stream: tokio::net::UnixStream,
-    pub client_id: String,
+    stream: UnixStream,
+    pending: Vec<u8>,
 }
-
+fn socket_paths() -> Vec<PathBuf> {
+    let mut dirs = Vec::new();
+    for key in ["XDG_RUNTIME_DIR", "TMPDIR", "TMP", "TEMP"] {
+        if let Some(d) = std::env::var_os(key)
+            .map(PathBuf::from)
+            .filter(|p| p.is_absolute())
+        {
+            if key == "XDG_RUNTIME_DIR" {
+                dirs.push(d.join("app/com.discordapp.Discord"));
+                dirs.push(d.join("discord-ipc"));
+            }
+            dirs.push(d);
+        }
+    }
+    dirs.push(PathBuf::from("/tmp"));
+    dirs.into_iter()
+        .flat_map(|d| (0..10).map(move |n| d.join(format!("discord-ipc-{n}"))))
+        .collect()
+}
 impl DiscordRpcSession {
-    /// Attempts to connect to an active local Discord IPC instance
-    pub async fn connect(client_id: &str) -> Result<Self, String> {
-        #[cfg(windows)]
-        {
-            let mut last_err = String::new();
-            for i in 0..10 {
-                let pipe_path = format!(r"\\.\pipe\discord-ipc-{}", i);
-                match ClientOptions::new().open(&pipe_path) {
-                    Ok(client) => {
-                        let mut session = Self {
-                            stream: client,
-                            client_id: client_id.to_string(),
-                        };
-                        session.handshake(client_id).await?;
-                        return Ok(session);
-                    }
-                    Err(e) => {
-                        last_err = e.to_string();
-                    }
-                }
-            }
-            Err(format!(
-                "Failed to connect to Windows Discord named pipe (discord-ipc-0..9): {}",
-                last_err
-            ))
+    pub async fn connect(id: &str) -> Result<Self, String> {
+        if !valid_id(id) {
+            return Err("Invalid application ID".into());
         }
-
-        #[cfg(unix)]
-        {
-            let mut search_dirs: Vec<std::path::PathBuf> = Vec::new();
-
-            if let Ok(runtime_dir) = std::env::var("XDG_RUNTIME_DIR") {
-                search_dirs.push(std::path::PathBuf::from(&runtime_dir));
-                search_dirs.push(std::path::PathBuf::from(&runtime_dir).join("app/com.discordapp.Discord"));
-                search_dirs.push(std::path::PathBuf::from(&runtime_dir).join("discord-ipc"));
+        for path in socket_paths() {
+            let Ok(m) = std::fs::symlink_metadata(&path) else {
+                continue;
+            };
+            // Never follow socket symlinks or connect to another user's server.
+            if !m.file_type().is_socket() || m.uid() != unsafe { libc::geteuid() } {
+                continue;
             }
-
-            search_dirs.push(std::path::PathBuf::from("/tmp"));
-
-            let mut last_err = String::from("No Discord UNIX socket found");
-            for dir in search_dirs {
-                for i in 0..10 {
-                    let socket_path = dir.join(format!("discord-ipc-{}", i));
-                    if socket_path.exists() {
-                        match tokio::net::UnixStream::connect(&socket_path).await {
-                            Ok(client) => {
-                                let mut session = Self {
-                                    stream: client,
-                                    client_id: client_id.to_string(),
-                                };
-                                session.handshake(client_id).await?;
-                                return Ok(session);
-                            }
-                            Err(e) => {
-                                last_err = e.to_string();
-                            }
-                        }
-                    }
+            let Ok(Ok(stream)) = tokio::time::timeout(TIMEOUT, UnixStream::connect(&path)).await
+            else {
+                continue;
+            };
+            if stream.peer_cred().map_err(|e| e.to_string())?.uid() != unsafe { libc::geteuid() } {
+                continue;
+            }
+            let mut s = Self {
+                stream,
+                pending: Vec::new(),
+            };
+            let result: Result<(), String> = tokio::time::timeout(TIMEOUT, async {
+                s.write(0, &json!({"v":1,"client_id":id})).await?;
+                let v = s.frame().await?;
+                if v["evt"] != "READY" || v["cmd"] != "DISPATCH" {
+                    return Err("Discord did not confirm READY".into());
                 }
-            }
-            Err(format!("Failed to connect to Linux Discord IPC: {}", last_err))
+                Ok(())
+            })
+            .await
+            .map_err(|_| "Discord handshake timed out".to_string())?;
+            result?;
+            return Ok(s);
         }
-
-        #[cfg(not(any(windows, unix)))]
-        {
-            Err("Discord IPC is only supported on Windows and Unix platforms".to_string())
+        Err("Discord IPC недоступен. Запустите Discord Desktop; для Flatpak проверьте доступ к IPC.".into())
+    }
+    async fn write(&mut self, op: u32, v: &Value) -> Result<(), String> {
+        let data = serde_json::to_vec(v).map_err(|e| e.to_string())?;
+        self.write_raw(op, &data).await
+    }
+    async fn write_raw(&mut self, op: u32, data: &[u8]) -> Result<(), String> {
+        if data.len() > MAX_FRAME {
+            return Err("Oversized IPC payload".into());
+        }
+        let mut bytes = Vec::with_capacity(data.len() + 8);
+        bytes.extend_from_slice(&op.to_le_bytes());
+        bytes.extend_from_slice(&(data.len() as u32).to_le_bytes());
+        bytes.extend_from_slice(data);
+        tokio::time::timeout(TIMEOUT, self.stream.write_all(&bytes))
+            .await
+            .map_err(|_| "IPC write timed out".to_string())?
+            .map_err(|e| e.to_string())
+    }
+    async fn frame(&mut self) -> Result<Value, String> {
+        loop {
+            let mut header = [0u8; 8];
+            self.stream
+                .read_exact(&mut header)
+                .await
+                .map_err(|e| e.to_string())?;
+            let op = u32::from_le_bytes(header[..4].try_into().unwrap());
+            let len = u32::from_le_bytes(header[4..].try_into().unwrap()) as usize;
+            if len > MAX_FRAME {
+                return Err("Oversized IPC frame".into());
+            }
+            let mut body = vec![0; len];
+            self.stream
+                .read_exact(&mut body)
+                .await
+                .map_err(|e| e.to_string())?;
+            if op == 3 {
+                self.write_raw(4, &body).await?;
+                continue;
+            }
+            if op != 1 {
+                return Err(format!("Unexpected Discord IPC opcode {op}"));
+            }
+            return serde_json::from_slice(&body).map_err(|e| e.to_string());
         }
     }
-
-    /// Performs the Opcode 0 handshake
-    async fn handshake(&mut self, client_id: &str) -> Result<(), String> {
-        let payload = json!({
-            "v": 1,
-            "client_id": client_id
-        })
-        .to_string();
-
-        self.write_packet(OP_HANDSHAKE, &payload).await?;
-
-        // Read DISPATCH / READY response
-        let (op, response) = self.read_packet().await?;
-        if op != OP_FRAME {
-            return Err(format!("Expected OP_FRAME (1) after handshake, got {}", op));
-        }
-
-        let parsed: Value = serde_json::from_str(&response)
-            .map_err(|e| format!("Failed to parse handshake response JSON: {}", e))?;
-
-        if parsed.get("evt").and_then(|v| v.as_str()) != Some("READY")
-            && parsed.get("cmd").and_then(|v| v.as_str()) != Some("DISPATCH")
-        {
-            // Even if evt is not READY, Discord sometimes accepts frames
-        }
-
-        Ok(())
-    }
-
-    /// Sets the active game via Opcode 1 SET_ACTIVITY
     pub async fn set_activity(
         &mut self,
-        _game_name: &str,
-        start_timestamp_ms: u64,
+        _name: &str,
+        start_ms: u64,
         pid: u32,
     ) -> Result<(), String> {
-        let nonce = format!(
-            "{}-{}",
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_millis(),
-            pid
-        );
-
-        let payload = json!({
-            "cmd": "SET_ACTIVITY",
-            "args": {
-                "pid": pid,
-                "activity": {
-                    "timestamps": {
-                        "start": start_timestamp_ms
-                    },
-                    "instance": true
+        let nonce = format!("{pid}-{start_ms}");
+        self.write(1,&json!({"cmd":"SET_ACTIVITY","args":{"pid":pid,"activity":{"timestamps":{"start":start_ms},"instance":true}},"nonce":nonce})).await?;
+        tokio::time::timeout(TIMEOUT, async {
+            loop {
+                let v = self.frame().await?;
+                if v["nonce"] != nonce {
+                    continue;
                 }
-            },
-            "nonce": nonce
+                return confirm_activity(&v);
+            }
         })
-        .to_string();
-
-        self.write_packet(OP_FRAME, &payload).await?;
-
-        // Read response (timeout or ignore errors gracefully)
-        let _ = tokio::time::timeout(std::time::Duration::from_millis(500), self.read_packet()).await;
-
-        Ok(())
+        .await
+        .map_err(|_| "Discord activity acknowledgement timed out".to_string())?
     }
-
-    /// Clears the activity
-    pub async fn clear_activity(&mut self, pid: u32) -> Result<(), String> {
-        let nonce = format!(
-            "clear-{}",
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_millis()
-        );
-
-        let payload = json!({
-            "cmd": "SET_ACTIVITY",
-            "args": {
-                "pid": pid,
-                "activity": null
-            },
-            "nonce": nonce
-        })
-        .to_string();
-
-        let _ = self.write_packet(OP_FRAME, &payload).await;
-        Ok(())
-    }
-
-    /// Writes raw opcode + payload to the IPC socket
-    async fn write_packet(&mut self, opcode: u32, payload: &str) -> Result<(), String> {
-        let bytes = payload.as_bytes();
-        let len = bytes.len() as u32;
-
-        let mut header = [0u8; 8];
-        header[0..4].copy_from_slice(&opcode.to_le_bytes());
-        header[4..8].copy_from_slice(&len.to_le_bytes());
-
-        self.stream
-            .write_all(&header)
-            .await
-            .map_err(|e| format!("Failed to write IPC packet header: {}", e))?;
-
-        self.stream
-            .write_all(bytes)
-            .await
-            .map_err(|e| format!("Failed to write IPC payload: {}", e))?;
-
-        self.stream
-            .flush()
-            .await
-            .map_err(|e| format!("Failed to flush IPC stream: {}", e))?;
-
-        Ok(())
-    }
-
-    /// Reads raw opcode + payload from the IPC socket
-    async fn read_packet(&mut self) -> Result<(u32, String), String> {
-        let mut header = [0u8; 8];
-        self.stream
-            .read_exact(&mut header)
-            .await
-            .map_err(|e| format!("Failed to read IPC packet header: {}", e))?;
-
-        let opcode = u32::from_le_bytes(header[0..4].try_into().unwrap());
-        let length = u32::from_le_bytes(header[4..8].try_into().unwrap());
-
-        if length > 65536 {
-            return Err(format!("IPC packet length too large: {} bytes", length));
+    /// Consume heartbeats and detect disconnects during long sessions without losing partial frames.
+    pub async fn poll_connection(&mut self) -> Result<(), String> {
+        let mut chunk = [0u8; 4096];
+        loop {
+            match self.stream.try_read(&mut chunk) {
+                Ok(0) => return Err("Discord IPC closed".into()),
+                Ok(n) => {
+                    self.pending.extend_from_slice(&chunk[..n]);
+                    if self.pending.len() > MAX_FRAME + 8 {
+                        return Err("Oversized buffered IPC data".into());
+                    }
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+                Err(e) => return Err(e.to_string()),
+            }
         }
-
-        let mut body = vec![0u8; length as usize];
-        self.stream
-            .read_exact(&mut body)
-            .await
-            .map_err(|e| format!("Failed to read IPC packet payload: {}", e))?;
-
-        let text = String::from_utf8(body)
-            .map_err(|e| format!("Failed to decode IPC packet payload as UTF-8: {}", e))?;
-
-        Ok((opcode, text))
+        while self.pending.len() >= 8 {
+            let op = u32::from_le_bytes(self.pending[..4].try_into().unwrap());
+            let len = u32::from_le_bytes(self.pending[4..8].try_into().unwrap()) as usize;
+            if len > MAX_FRAME {
+                return Err("Oversized IPC frame".into());
+            }
+            if self.pending.len() < len + 8 {
+                break;
+            }
+            let body = self.pending[8..8 + len].to_vec();
+            self.pending.drain(..8 + len);
+            match op {
+                3 => self.write_raw(4, &body).await?,
+                4 => (),
+                1 => {
+                    let v: Value = serde_json::from_slice(&body).map_err(|e| e.to_string())?;
+                    if v["evt"] == "ERROR" {
+                        return Err("Discord reported an IPC error".into());
+                    }
+                }
+                _ => return Err("Discord IPC closed or invalid opcode".into()),
+            }
+        }
+        Ok(())
     }
-
-    /// Gracefully closes the session
-    pub async fn close(mut self) {
-        let _ = self.write_packet(OP_CLOSE, "{}").await;
+    pub async fn clear_activity(&mut self, pid: u32) -> Result<(), String> {
+        self.write(
+            1,
+            &json!({"cmd":"SET_ACTIVITY","args":{"pid":pid,"activity":null},"nonce":"clear"}),
+        )
+        .await
+    }
+}
+fn confirm_activity(v: &Value) -> Result<(), String> {
+    if v["evt"] == "ERROR" {
+        return Err(format!(
+            "Discord rejected activity: {}",
+            v["data"]["message"]
+        ));
+    }
+    if v["cmd"] != "SET_ACTIVITY" || !v["data"].is_object() {
+        return Err("Invalid activity acknowledgement".into());
+    }
+    Ok(())
+}
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn error_is_not_success() {
+        assert!(confirm_activity(
+            &json!({"cmd":"SET_ACTIVITY","evt":"ERROR","data":{"message":"denied"}})
+        )
+        .is_err());
+        assert!(confirm_activity(&json!({"cmd":"DISPATCH"})).is_err());
+    }
+    #[tokio::test]
+    async fn rejects_oversized_frame() {
+        let (client, mut server) = UnixStream::pair().unwrap();
+        let mut s = DiscordRpcSession {
+            stream: client,
+            pending: Vec::new(),
+        };
+        let task = tokio::spawn(async move {
+            server.write_all(&[1, 0, 0, 0, 1, 0, 1, 0]).await.unwrap();
+        });
+        assert!(s.frame().await.unwrap_err().contains("Oversized"));
+        task.await.unwrap();
+    }
+    #[tokio::test]
+    async fn ping_pong_and_response() {
+        let (c, mut s) = UnixStream::pair().unwrap();
+        let mut session = DiscordRpcSession {
+            stream: c,
+            pending: Vec::new(),
+        };
+        let t = tokio::spawn(async move {
+            for (op, body) in [
+                (3u32, b"hello".as_slice()),
+                (1, b"{\"evt\":\"READY\"}".as_slice()),
+            ] {
+                s.write_all(&op.to_le_bytes()).await.unwrap();
+                s.write_all(&(body.len() as u32).to_le_bytes())
+                    .await
+                    .unwrap();
+                s.write_all(body).await.unwrap();
+            }
+            let mut pong = [0; 13];
+            s.read_exact(&mut pong).await.unwrap();
+            assert_eq!(&pong[..4], &4u32.to_le_bytes());
+            assert_eq!(&pong[8..], b"hello");
+        });
+        assert_eq!(session.frame().await.unwrap()["evt"], "READY");
+        t.await.unwrap();
+    }
+    #[tokio::test]
+    async fn timeout_is_not_success() {
+        let (c, _s) = UnixStream::pair().unwrap();
+        let mut session = DiscordRpcSession {
+            stream: c,
+            pending: Vec::new(),
+        };
+        assert!(session
+            .set_activity("x", 1, 1)
+            .await
+            .unwrap_err()
+            .contains("timed out"));
+    }
+    #[tokio::test]
+    async fn detects_closed_connection() {
+        let (client, server) = UnixStream::pair().unwrap();
+        let mut session = DiscordRpcSession {
+            stream: client,
+            pending: Vec::new(),
+        };
+        drop(server);
+        session.stream.readable().await.unwrap();
+        assert!(session.poll_connection().await.is_err());
+    }
+    #[tokio::test]
+    async fn retains_partial_heartbeat() {
+        let (client, mut server) = UnixStream::pair().unwrap();
+        let mut session = DiscordRpcSession {
+            stream: client,
+            pending: Vec::new(),
+        };
+        server.write_all(&[3, 0, 0, 0]).await.unwrap();
+        session.stream.readable().await.unwrap();
+        session.poll_connection().await.unwrap();
+        assert_eq!(session.pending.len(), 4);
+        server.write_all(&[2, 0, 0, 0, 111, 107]).await.unwrap();
+        session.stream.readable().await.unwrap();
+        session.poll_connection().await.unwrap();
+        assert!(session.pending.is_empty());
+        let mut pong = [0; 10];
+        server.read_exact(&mut pong).await.unwrap();
+        assert_eq!(pong, [4, 0, 0, 0, 2, 0, 0, 0, 111, 107]);
     }
 }

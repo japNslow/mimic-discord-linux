@@ -24,7 +24,9 @@ fn main() {
         cmd.arg("--target").arg(target);
     }
 
-    let status = cmd.status().expect("Failed to execute rustc to compile dummy.rs");
+    let status = cmd
+        .status()
+        .expect("Failed to execute rustc to compile dummy.rs");
     if !status.success() {
         panic!("Failed to compile dummy binary helper: status {:?}", status);
     }

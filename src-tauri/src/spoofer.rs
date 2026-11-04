@@ -1,912 +1,420 @@
 use crate::discord::{SpoofMethod, SpoofableGame};
 use crate::history::{load_history, record_played_batch};
-use crate::i18n::{is_russian, pick};
 use crate::rpc::DiscordRpcSession;
+use crate::security::{data_dir, private_tempdir, safe_relative};
 use crate::state::{
-    ActiveGameInfo, SpooferConfig, SpooferLogEvent, SpooferStatus, SpooferStatusEvent,
-    SpooferTickEvent, SpoofMode,
+    ActiveGameInfo, AppState, SpoofMode, SpooferConfig, SpooferLogEvent, SpooferStatus,
+    SpooferStatusEvent, SpooferTickEvent,
 };
 use std::collections::HashSet;
-use std::fs;
-use std::path::{Path, PathBuf};
-use std::process::{Child, Command};
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::fs::{self, OpenOptions};
+use std::io::Write;
+use std::os::unix::{fs::OpenOptionsExt, process::CommandExt};
+use std::path::Path;
+use std::process::{Child, Command, Stdio};
+use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
-use tauri::{AppHandle, Emitter};
-use tokio::sync::{Mutex, Notify, RwLock};
-
-#[cfg(windows)]
-static DUMMY_EXE_BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/dummy.exe"));
-#[cfg(not(windows))]
-static DUMMY_EXE_BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/dummy"));
-
-const MAX_FARM_GAMES: usize = 20;
+use tauri::{AppHandle, Emitter, Manager};
+static DUMMY: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/dummy"));
+const MAX_SESSION: Duration = Duration::from_secs(8 * 3600);
 
 pub(crate) fn log_event(app: &AppHandle, level: &str, message: &str) {
-    let now = chrono_now_string();
+    let seconds = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+        % 86400;
     let _ = app.emit(
         "spoofer_log",
         SpooferLogEvent {
-            timestamp: now,
-            level: level.to_string(),
-            message: message.to_string(),
+            timestamp: format!(
+                "{:02}:{:02}:{:02} UTC",
+                seconds / 3600,
+                seconds % 3600 / 60,
+                seconds % 60
+            ),
+            level: level.into(),
+            message: message.into(),
         },
     );
 }
-
-fn chrono_now_string() -> String {
-    let now = SystemTime::now();
-    let duration = now.duration_since(UNIX_EPOCH).unwrap_or_default();
-    let secs = duration.as_secs();
-    let sec_in_day = secs % 86400;
-    let hours = sec_in_day / 3600;
-    let mins = (sec_in_day % 3600) / 60;
-    let s = sec_in_day % 60;
-    format!("{:02}:{:02}:{:02}", hours, mins, s)
-}
-
-fn cleanup_temp_dir(temp_dir: &Path) {
-    if temp_dir.exists() {
-        let _ = fs::remove_dir_all(temp_dir);
-    }
-}
-
-pub fn force_kill_pid(pid: u32) {
-    #[cfg(windows)]
-    unsafe {
-        use windows_sys::Win32::Foundation::CloseHandle;
-        use windows_sys::Win32::System::Threading::{OpenProcess, TerminateProcess, PROCESS_TERMINATE};
-        let h = OpenProcess(PROCESS_TERMINATE, 0, pid);
-        if !h.is_null() {
-            TerminateProcess(h, 1);
-            CloseHandle(h);
-        }
-    }
-    #[cfg(unix)]
-    unsafe {
-        libc::kill(pid as i32, libc::SIGKILL);
-    }
-}
-
-// Win32 Job Object sandbox
-#[cfg(windows)]
-struct JobObjectGuard {
-    handle: windows_sys::Win32::Foundation::HANDLE,
-}
-
-#[cfg(windows)]
-impl JobObjectGuard {
-    fn new() -> Option<Self> {
-        use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
-        use windows_sys::Win32::System::JobObjects::{
-            CreateJobObjectW, SetInformationJobObject, JobObjectExtendedLimitInformation,
-            JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
-        };
-        unsafe {
-            let handle = CreateJobObjectW(std::ptr::null_mut(), std::ptr::null());
-            if handle.is_null() || handle == INVALID_HANDLE_VALUE {
-                return None;
-            }
-
-            let mut info: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = std::mem::zeroed();
-            info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
-
-            let res = SetInformationJobObject(
-                handle,
-                JobObjectExtendedLimitInformation,
-                &info as *const _ as *const std::ffi::c_void,
-                std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
-            );
-
-            if res == 0 {
-                windows_sys::Win32::Foundation::CloseHandle(handle);
-                return None;
-            }
-
-            Some(Self { handle })
-        }
-    }
-
-    fn assign_pid(&self, pid: u32) {
-        use windows_sys::Win32::Foundation::CloseHandle;
-        use windows_sys::Win32::System::JobObjects::AssignProcessToJobObject;
-        use windows_sys::Win32::System::Threading::{OpenProcess, PROCESS_SET_QUOTA, PROCESS_TERMINATE};
-        unsafe {
-            let proc_h = OpenProcess(PROCESS_SET_QUOTA | PROCESS_TERMINATE, 0, pid);
-            if !proc_h.is_null() {
-                AssignProcessToJobObject(self.handle, proc_h);
-                CloseHandle(proc_h);
-            }
-        }
-    }
-}
-
-#[cfg(windows)]
-impl Drop for JobObjectGuard {
-    fn drop(&mut self) {
-        unsafe {
-            windows_sys::Win32::Foundation::CloseHandle(self.handle);
-        }
-    }
-}
-
-#[cfg(windows)]
-unsafe impl Send for JobObjectGuard {}
-#[cfg(windows)]
-unsafe impl Sync for JobObjectGuard {}
-
-/// Picks the fixed farm set. Games sharing an exe name can't run side by side,
-/// so duplicates are dropped here instead of spilling into a second batch.
-fn select_farm_games(
-    app: &AppHandle,
-    games: Vec<SpoofableGame>,
-    farm_game_ids: &[String],
-) -> Vec<SpoofableGame> {
-    let mut exe_basenames: HashSet<String> = HashSet::new();
-    let mut selected: Vec<SpoofableGame> = Vec::new();
-
-    for id in farm_game_ids {
-        if selected.len() >= MAX_FARM_GAMES {
-            break;
-        }
-        let Some(game) = games.iter().find(|g| &g.id == id) else {
-            continue;
-        };
-
-        if game.method == SpoofMethod::Process {
-            if let Some(rel) = &game.rel_path {
-                let exe_name = Path::new(rel)
-                    .file_name()
-                    .map(|s| s.to_string_lossy().to_lowercase())
-                    .unwrap_or_default();
-
-                if !exe_name.is_empty() && !exe_basenames.insert(exe_name.clone()) {
-                    let message = if is_russian() {
-                        format!("Фарм: '{}' пропущена, файл {} уже занят другой игрой.", game.name, exe_name)
-                    } else {
-                        format!("Farm: skipped '{}', {} is already used by another game.", game.name, exe_name)
-                    };
-                    log_event(app, "warn", &message);
-                    continue;
-                }
-            }
-        }
-
-        selected.push(game.clone());
-    }
-
-    selected
-}
-
-pub async fn run_spoofer(
-    app: AppHandle,
-    all_games: Vec<SpoofableGame>,
-    config: SpooferConfig,
-    status_lock: Arc<RwLock<SpooferStatus>>,
-    cancel_flag: Arc<AtomicBool>,
-    pause_flag: Arc<AtomicBool>,
-    resume_notify: Arc<Notify>,
-    active_pids: Arc<Mutex<Vec<u32>>>,
-) {
-    let mode_filtered_games: Vec<SpoofableGame> = match config.spoof_mode {
-        SpoofMode::Hybrid => all_games,
-        SpoofMode::ProcessOnly => all_games
-            .into_iter()
-            .filter(|g| g.method == SpoofMethod::Process)
-            .collect(),
-        SpoofMode::RpcOnly => all_games
-            .into_iter()
-            .filter(|g| g.method == SpoofMethod::Rpc)
-            .collect(),
-    };
-
-    let is_farm = !config.farm_game_ids.is_empty();
-    let history = load_history();
-    let mut pool: Vec<SpoofableGame> = if is_farm {
-        select_farm_games(&app, mode_filtered_games, &config.farm_game_ids)
-    } else if config.skip_previously_spoofed {
-        let before_count = mode_filtered_games.len();
-        let filtered: Vec<SpoofableGame> = mode_filtered_games
-            .into_iter()
-            .filter(|g| !history.contains(&g.id))
-            .collect();
-        let skipped = before_count - filtered.len();
-        if skipped > 0 {
-            let message = if is_russian() {
-                format!("Пропуск {} ранее эмулированных игр из истории.", skipped)
-            } else {
-                format!("Skipped {} previously spoofed games from history.", skipped)
-            };
-            log_event(&app, "info", &message);
-        }
-        filtered
-    } else {
-        mode_filtered_games
-    };
-
-    let total_available = pool.len();
-    if total_available == 0 {
-        *status_lock.write().await = SpooferStatus::Finished;
-        let _ = app.emit(
-            "spoofer_status",
-            SpooferStatusEvent {
-                status: SpooferStatus::Finished,
-                message: Some(
-                    if is_farm {
-                        pick(
-                            "Выбранные для фарма игры недоступны.",
-                            "The games selected for farming are unavailable.",
-                        )
-                    } else {
-                        pick(
-                            "Все доступные игры уже эмулированы согласно истории!",
-                            "All available games are already spoofed according to history!",
-                        )
-                    }
-                    .to_string(),
-                ),
-            },
-        );
-        if is_farm {
-            log_event(
-                &app,
-                "warn",
-                pick(
-                    "Выбранные для фарма игры недоступны.",
-                    "The games selected for farming are unavailable.",
-                ),
-            );
-        } else {
-            log_event(
-                &app,
-                "success",
-                pick(
-                    "Все игры уже были обработаны.",
-                    "All games have already been processed.",
-                ),
-            );
-        }
-        return;
-    }
-
-    let target_count = if is_farm {
-        total_available
-    } else {
-        config
-            .limit
-            .map(|lim| lim.min(total_available))
-            .unwrap_or(total_available)
-    };
-
-    // A farm is a single batch, so it never rotates to other games.
-    let batch_size = if is_farm {
-        total_available
-    } else {
-        config.batch_size.clamp(1, 20)
-    };
-
-    // Initialize Win32 Job Object sandbox for orphan process protection
-    #[cfg(windows)]
-    let job_guard = JobObjectGuard::new();
-
-    // Prepare temp directory for process spoofing
-    let temp_root = std::env::temp_dir().join("mimic_spoofer");
-    cleanup_temp_dir(&temp_root);
-
-    if let Err(e) = fs::create_dir_all(&temp_root) {
-        *status_lock.write().await = SpooferStatus::Error;
-        let err_msg = if is_russian() {
-            format!("Ошибка создания временной папки: {}", e)
-        } else {
-            format!("Failed to create the temporary folder: {}", e)
-        };
-        let _ = app.emit(
-            "spoofer_status",
-            SpooferStatusEvent {
-                status: SpooferStatus::Error,
-                message: Some(err_msg.clone()),
-            },
-        );
-        log_event(&app, "error", &err_msg);
-        return;
-    }
-
-    #[cfg(windows)]
-    let base_dummy_path = temp_root.join("base_dummy.exe");
-    #[cfg(not(windows))]
-    let base_dummy_path = temp_root.join("base_dummy");
-
-    if let Err(e) = fs::write(&base_dummy_path, DUMMY_EXE_BYTES) {
-        *status_lock.write().await = SpooferStatus::Error;
-        let err_msg = if is_russian() {
-            format!("Не удалось создать базовый бинарный файл: {}", e)
-        } else {
-            format!("Failed to create the base binary file: {}", e)
-        };
-        let _ = app.emit(
-            "spoofer_status",
-            SpooferStatusEvent {
-                status: SpooferStatus::Error,
-                message: Some(err_msg.clone()),
-            },
-        );
-        log_event(&app, "error", &err_msg);
-        cleanup_temp_dir(&temp_root);
-        return;
-    }
-
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = fs::set_permissions(&base_dummy_path, fs::Permissions::from_mode(0o755));
-    }
-
-    *status_lock.write().await = SpooferStatus::Running;
+async fn status(app: &AppHandle, value: SpooferStatus, message: Option<String>) {
+    *app.state::<AppState>().status.write().await = value;
     let _ = app.emit(
         "spoofer_status",
         SpooferStatusEvent {
-            status: SpooferStatus::Running,
-            message: None,
+            status: value,
+            message,
         },
     );
-
-    let mode_str = match config.spoof_mode {
-        SpoofMode::Hybrid => pick("Гибридный (Процессы + RPC)", "Hybrid (processes + RPC)"),
-        SpoofMode::ProcessOnly => pick("Только процессы (.exe)", "Native processes only"),
-        SpoofMode::RpcOnly => pick("Остальные (Discord IPC/RPC)", "Other (Discord IPC/RPC)"),
-    };
-
-    let start_message = if is_farm {
-        if is_russian() {
-            format!("Старт фарма: {} игр без смены.", target_count)
-        } else {
-            format!("Farm started: {} games with no rotation.", target_count)
+}
+fn cancelled(app: &AppHandle) -> bool {
+    app.state::<AppState>().cancel_flag.load(Ordering::SeqCst)
+}
+fn paused(app: &AppHandle) -> bool {
+    app.state::<AppState>().pause_flag.load(Ordering::SeqCst)
+}
+fn expired(start: Instant) -> bool {
+    start.elapsed() >= MAX_SESSION
+}
+// Owning Child handles prevents killing an unrelated process after PID reuse.
+struct OwnedChild(Child);
+impl Drop for OwnedChild {
+    fn drop(&mut self) {
+        if !matches!(self.0.try_wait(), Ok(Some(_))) {
+            let _ = self.0.kill();
         }
-    } else if is_russian() {
-        format!(
-            "Старт mimic: режим {}, цель {} игр, батч {}, удержание {} сек",
-            mode_str, target_count, batch_size, config.hold_duration_secs
-        )
-    } else {
-        format!(
-            "mimic started: mode {}, target {} games, batch {}, hold {} sec",
-            mode_str, target_count, batch_size, config.hold_duration_secs
-        )
-    };
-    log_event(&app, "info", &start_message);
-
-    let start_time = Instant::now();
-    let mut processed_count = 0usize;
-    let mut batch_counter = 0usize;
-
-    while processed_count < target_count && !pool.is_empty() {
-        if cancel_flag.load(Ordering::SeqCst) {
-            log_event(
+        let _ = self.0.wait();
+    }
+}
+fn spawn_helper(root: &Path, game: &SpoofableGame) -> Result<OwnedChild, String> {
+    if !game.validate() {
+        return Err("Invalid game data".into());
+    }
+    let rel = safe_relative(game.rel_path.as_deref().ok_or("Missing executable")?)
+        .ok_or("Unsafe executable path")?;
+    let path = root.join(rel);
+    fs::create_dir_all(path.parent().ok_or("No parent directory")?).map_err(|e| e.to_string())?;
+    // Only write our embedded helper, never execute anything from the database.
+    let mut f = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o700)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(&path)
+        .map_err(|e| e.to_string())?;
+    f.write_all(DUMMY).map_err(|e| e.to_string())?;
+    drop(f);
+    let parent = std::process::id() as i32;
+    let mut c = Command::new(path);
+    c.arg(parent.to_string())
+        .current_dir(root)
+        .env_clear()
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    unsafe {
+        c.pre_exec(move || {
+            if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL, 0, 0, 0) != 0
+                || libc::getppid() != parent
+                || libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0
+            {
+                return Err(std::io::Error::other("Cannot secure helper process"));
+            }
+            Ok(())
+        });
+    }
+    c.spawn().map(OwnedChild).map_err(|e| e.to_string())
+}
+fn emit_tick(
+    app: &AppHandle,
+    active: Vec<ActiveGameInfo>,
+    done: usize,
+    total: usize,
+    start: Instant,
+    remaining: u64,
+) {
+    let _ = app.emit(
+        "spoofer_tick",
+        SpooferTickEvent {
+            current_index: done,
+            total_games: total,
+            active_batch: active,
+            elapsed_secs: start.elapsed().as_secs(),
+            estimated_remaining_secs: remaining,
+            games_per_minute: 0.0,
+        },
+    );
+}
+async fn wait(app: &AppHandle, duration: Duration, start: Instant) {
+    let end = Instant::now() + duration;
+    while Instant::now() < end && !cancelled(app) && !expired(start) {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+pub async fn run_spoofer(app: AppHandle, games: Vec<SpoofableGame>, config: SpooferConfig) {
+    let result = run(&app, games, config).await;
+    match result {
+        Ok(()) => {
+            status(
                 &app,
-                "warn",
-                pick(
-                    "Процесс остановлен пользователем.",
-                    "Stopped by the user.",
-                ),
-            );
-            break;
+                if cancelled(&app) {
+                    SpooferStatus::Idle
+                } else {
+                    SpooferStatus::Finished
+                },
+                None,
+            )
+            .await
         }
-
-        // Smart Cooldown Manager
-        if config.cooldown_enabled && batch_counter > 0 && batch_counter % config.cooldown_every_n_batches == 0 {
-            let cooldown_message = if is_russian() {
-                format!(
-                    "Кулдаун: пауза {} сек для защиты от рейтлимитов Discord...",
-                    config.cooldown_seconds
-                )
+        Err(e) => {
+            log_event(&app, "error", &e);
+            status(&app, SpooferStatus::Error, Some(e)).await;
+        }
+    }
+}
+async fn run(
+    app: &AppHandle,
+    games: Vec<SpoofableGame>,
+    config: SpooferConfig,
+) -> Result<(), String> {
+    config.validate()?;
+    let start = Instant::now();
+    let farm = !config.farm_game_ids.is_empty();
+    let history = load_history()?;
+    let mut pool: Vec<_> = games
+        .into_iter()
+        .filter(|g| g.validate())
+        .filter(|g| match config.spoof_mode {
+            SpoofMode::ProcessOnly => g.method == SpoofMethod::Process,
+            SpoofMode::RpcOnly => g.method == SpoofMethod::Rpc,
+            SpoofMode::Hybrid => true,
+        })
+        .filter(|g| {
+            if farm {
+                config.farm_game_ids.contains(&g.id)
             } else {
-                format!(
-                    "Cooldown: pausing {} sec to avoid Discord rate limits...",
-                    config.cooldown_seconds
-                )
-            };
-            log_event(&app, "info", &cooldown_message);
-            let cd_start = Instant::now();
-            let cd_duration = Duration::from_secs(config.cooldown_seconds);
-            while cd_start.elapsed() < cd_duration {
-                if cancel_flag.load(Ordering::SeqCst) {
-                    break;
-                }
-                tokio::time::sleep(Duration::from_millis(250)).await;
+                !config.skip_previously_spoofed || !history.contains(&g.id)
             }
-            if cancel_flag.load(Ordering::SeqCst) {
-                break;
-            }
-            log_event(
-                &app,
-                "info",
-                pick(
-                    "Кулдаун завершен, продолжение работы.",
-                    "Cooldown finished, resuming.",
-                ),
-            );
+        })
+        .skip(if farm {
+            0
+        } else {
+            config.start_offset.unwrap_or(0)
+        })
+        .take(if farm {
+            4
+        } else {
+            config.limit.unwrap_or(100_000)
+        })
+        .collect();
+    let total = pool.len();
+    if total == 0 {
+        return Err("Нет подходящих игр. Обновите базу, проверьте фильтр и историю.".into());
+    }
+    let dir = data_dir()?;
+    // Private random directories; RAII also cleans up on normal error unwinding.
+    let session = private_tempdir(&dir, "session-")?;
+    let mut done = 0;
+    let mut completed = 0;
+    let mut batches = 0;
+    log_event(
+        app,
+        "info",
+        "Сессия запущена. Автоматическая остановка через 8 часов. Зачёт Discord не проверяется.",
+    );
+    while !pool.is_empty() && !cancelled(app) && !expired(start) {
+        while paused(app) && !cancelled(app) && !expired(start) {
+            tokio::time::sleep(Duration::from_millis(100)).await;
         }
-
-        // Check pause
-        if pause_flag.load(Ordering::SeqCst) {
-            *status_lock.write().await = SpooferStatus::Paused;
-            let _ = app.emit(
-                "spoofer_status",
-                SpooferStatusEvent {
-                    status: SpooferStatus::Paused,
-                    message: None,
-                },
-            );
-            log_event(
-                &app,
-                "warn",
-                pick("Пауза. Ожидание возобновления...", "Paused. Waiting to resume..."),
-            );
-            resume_notify.notified().await;
-            if cancel_flag.load(Ordering::SeqCst) {
-                break;
-            }
-            *status_lock.write().await = SpooferStatus::Running;
-            let _ = app.emit(
-                "spoofer_status",
-                SpooferStatusEvent {
-                    status: SpooferStatus::Running,
-                    message: None,
-                },
-            );
-            log_event(
-                &app,
-                "info",
-                pick("Продолжение работы.", "Resuming."),
-            );
-        }
-
-        let mut current_batch: Vec<SpoofableGame> = Vec::new();
-        let mut active_exe_basenames: HashSet<String> = HashSet::new();
-        let mut indices_to_remove: Vec<usize> = Vec::new();
-
-        for (idx, game) in pool.iter().enumerate() {
-            if current_batch.len() >= batch_size || (processed_count + current_batch.len()) >= target_count {
-                break;
-            }
-
-            if game.method == SpoofMethod::Process {
-                if let Some(rel) = &game.rel_path {
-                    let exe_name = Path::new(rel)
-                        .file_name()
-                        .map(|s| s.to_string_lossy().to_lowercase())
-                        .unwrap_or_default();
-
-                    if !exe_name.is_empty() && active_exe_basenames.contains(&exe_name) {
-                        continue;
-                    }
-
-                    active_exe_basenames.insert(exe_name);
-                }
-            }
-
-            current_batch.push(game.clone());
-            indices_to_remove.push(idx);
-        }
-
-        for idx in indices_to_remove.into_iter().rev() {
-            pool.swap_remove(idx);
-        }
-
-        if current_batch.is_empty() {
+        if cancelled(app) || expired(start) {
             break;
         }
-
-        batch_counter += 1;
-
+        if config.cooldown_enabled && batches > 0 && batches % config.cooldown_every_n_batches == 0
         {
-            let mut pids_guard = active_pids.lock().await;
-            pids_guard.clear();
+            wait(app, Duration::from_secs(config.cooldown_seconds), start).await;
+            if cancelled(app) || expired(start) {
+                break;
+            }
         }
-
-        let mut spawned_processes: Vec<(Child, SpoofableGame, PathBuf)> = Vec::new();
-        let mut active_rpc_sessions: Vec<DiscordRpcSession> = Vec::new();
-        let mut active_batch_info: Vec<ActiveGameInfo> = Vec::new();
-
-        let batch_start_ms = SystemTime::now()
+        let size = if farm {
+            pool.len().min(4)
+        } else {
+            config.batch_size
+        };
+        let mut names = HashSet::new();
+        let mut batch = Vec::new();
+        let mut i = 0;
+        while i < pool.len() && batch.len() < size {
+            let key = pool[i]
+                .rel_path
+                .as_deref()
+                .and_then(|p| Path::new(p).file_name())
+                .map(|s| s.to_string_lossy().to_string());
+            if key.is_none_or(|k| names.insert(k)) {
+                batch.push(pool.remove(i));
+            } else {
+                i += 1;
+            }
+        }
+        if batch.is_empty() {
+            break;
+        }
+        let batch_dir = private_tempdir(session.path(), "batch-")?;
+        let mut children = Vec::new();
+        let mut rpc = Vec::new();
+        let mut active = Vec::new();
+        let stamp = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
             .as_millis() as u64;
-
-        for game in &current_batch {
-            if game.method == SpoofMethod::Process && game.rel_path.is_some() {
-                let rel = game.rel_path.as_ref().unwrap();
-                let target_exe_path = temp_root.join(rel);
-
-                if let Some(parent) = target_exe_path.parent() {
-                    let _ = fs::create_dir_all(parent);
-                }
-
-                if !target_exe_path.exists() {
-                    if fs::hard_link(&base_dummy_path, &target_exe_path).is_err() {
-                        let _ = fs::copy(&base_dummy_path, &target_exe_path);
-                    }
-                }
-
-                #[cfg(unix)]
-                {
-                    use std::os::unix::fs::PermissionsExt;
-                    let _ = fs::set_permissions(&target_exe_path, fs::Permissions::from_mode(0o755));
-                }
-
-                let mut cmd = Command::new(&target_exe_path);
-                cmd.arg(&game.name);
-
-                if let Some(args) = &game.arguments {
-                    for arg in args.split_whitespace() {
-                        cmd.arg(arg);
-                    }
-                }
-
-                #[cfg(windows)]
-                {
-                    use std::os::windows::process::CommandExt;
-                    cmd.creation_flags(0x00004000);
-                }
-
-                #[cfg(unix)]
-                {
-                    use std::os::unix::process::CommandExt;
-                    unsafe {
-                        cmd.pre_exec(|| {
-                            libc::prctl(1, libc::SIGKILL, 0, 0, 0);
-                            Ok(())
-                        });
-                    }
-                }
-
-                match cmd.spawn() {
-                    Ok(child) => {
-                        let pid = child.id();
-
-                        #[cfg(windows)]
-                        if let Some(guard) = &job_guard {
-                            guard.assign_pid(pid);
-                        }
-
-                        {
-                            let mut pids_guard = active_pids.lock().await;
-                            pids_guard.push(pid);
-                        }
-
-                        active_batch_info.push(ActiveGameInfo {
-                            id: game.id.clone(),
-                            name: game.name.clone(),
-                            executable: Some(rel.clone()),
-                            pid: Some(pid),
-                            icon_hash: game.icon_hash.clone(),
-                            method: "process".to_string(),
-                        });
-                        spawned_processes.push((child, game.clone(), target_exe_path));
-                    }
-                    Err(e) => {
-                        let message = if is_russian() {
-                            format!("Не удалось запустить процесс '{}': {}", game.name, e)
-                        } else {
-                            format!("Failed to launch process '{}': {}", game.name, e)
-                        };
-                        log_event(&app, "warn", &message);
-                    }
-                }
-            } else {
-                // RPC / Console / SDK game: spoof via local Discord IPC socket
-                match DiscordRpcSession::connect(&game.id).await {
-                    Ok(mut session) => {
-                        let current_pid = std::process::id();
-                        if let Err(e) = session.set_activity(&game.name, batch_start_ms, current_pid).await {
-                            let message = if is_russian() {
-                                format!("Ошибка установки RPC для '{}': {}", game.name, e)
-                            } else {
-                                format!("Failed to set RPC activity for '{}': {}", game.name, e)
-                            };
-                            log_event(&app, "warn", &message);
-                        } else {
-                            active_batch_info.push(ActiveGameInfo {
-                                id: game.id.clone(),
-                                name: game.name.clone(),
-                                executable: None,
-                                pid: None,
-                                icon_hash: game.icon_hash.clone(),
-                                method: "rpc".to_string(),
-                            });
-                            active_rpc_sessions.push(session);
-                        }
-                    }
-                    Err(e) => {
-                        let message = if is_russian() {
-                            format!("RPC пайп недоступен для '{}': {}", game.name, e)
-                        } else {
-                            format!("RPC pipe unavailable for '{}': {}", game.name, e)
-                        };
-                        log_event(&app, "warn", &message);
-                    }
-                }
-            }
-
-            tokio::time::sleep(Duration::from_millis(40)).await;
-        }
-
-        // Calculate holding duration with optional organic jitter
-        let hold_secs = if config.jitter_enabled {
-            let jitter = (batch_counter % 3) as u64 + 1;
-            config.hold_duration_secs + jitter
-        } else {
-            config.hold_duration_secs
-        };
-        let hold_duration = if is_farm {
-            config.farm_duration_secs.map(Duration::from_secs)
-        } else {
-            Some(Duration::from_secs(hold_secs.clamp(3, 3600)))
-        };
-
-        // Emit spoofer tick event
-        let elapsed_secs = start_time.elapsed().as_secs();
-        let games_done = processed_count;
-        let games_per_sec = if elapsed_secs > 0 {
-            games_done as f64 / elapsed_secs as f64
-        } else {
-            0.0
-        };
-        let remaining_games = target_count.saturating_sub(games_done);
-        let estimated_remaining_secs = if games_per_sec > 0.0 {
-            (remaining_games as f64 / games_per_sec) as u64
-        } else {
-            (remaining_games as u64 / batch_size as u64) * config.hold_duration_secs
-        };
-
-        let _ = app.emit(
-            "spoofer_tick",
-            SpooferTickEvent {
-                current_index: processed_count,
-                total_games: target_count,
-                active_batch: active_batch_info.clone(),
-                elapsed_secs,
-                estimated_remaining_secs,
-                games_per_minute: games_per_sec * 60.0,
-            },
-        );
-
-        let batch_titles: Vec<String> = current_batch
-            .iter()
-            .map(|g| {
-                if g.method == SpoofMethod::Process {
-                    format!("{} [exe]", g.name)
-                } else {
-                    format!("{} [rpc]", g.name)
-                }
-            })
-            .collect();
-
-        let batch_message = if is_russian() {
-            format!(
-                "Активный батч ({}/{}): {}",
-                processed_count + current_batch.len(),
-                target_count,
-                batch_titles.join(", ")
-            )
-        } else {
-            format!(
-                "Active batch ({}/{}): {}",
-                processed_count + current_batch.len(),
-                target_count,
-                batch_titles.join(", ")
-            )
-        };
-        log_event(&app, "info", &batch_message);
-
-        // Hold processes and RPC sessions for the duration
-        let mut hold_start = Instant::now();
-        let mut last_farm_tick = Instant::now();
-        while hold_duration.map_or(true, |limit| hold_start.elapsed() < limit) {
-            if cancel_flag.load(Ordering::SeqCst) {
+        for game in &batch {
+            if cancelled(app) || expired(start) {
                 break;
             }
-
-            // A farm can run for hours: keep the timer live and report games that died.
-            if is_farm && last_farm_tick.elapsed() >= Duration::from_secs(1) {
-                last_farm_tick = Instant::now();
-
-                spawned_processes.retain_mut(|(child, game, _)| {
-                    if matches!(child.try_wait(), Ok(Some(_))) {
-                        let message = if is_russian() {
-                            format!("Фарм: процесс '{}' завершился, часы по этой игре не идут.", game.name)
-                        } else {
-                            format!("Farm: the process for '{}' exited, this game is no longer counted.", game.name)
-                        };
-                        log_event(&app, "warn", &message);
-                        active_batch_info.retain(|info| info.id != game.id);
-                        false
-                    } else {
-                        true
+            let info = ActiveGameInfo {
+                id: game.id.clone(),
+                name: game.name.clone(),
+                executable: game.rel_path.clone(),
+                pid: None,
+                icon_hash: None,
+                method: if game.method == SpoofMethod::Process {
+                    "process"
+                } else {
+                    "rpc"
+                }
+                .into(),
+            };
+            if game.method == SpoofMethod::Process {
+                match spawn_helper(batch_dir.path(), game) {
+                    Ok(child) => {
+                        let mut info = info;
+                        info.pid = Some(child.0.id());
+                        children.push((child, game.id.clone()));
+                        active.push(info);
                     }
-                });
-
-                let held = hold_start.elapsed();
-                let _ = app.emit(
-                    "spoofer_tick",
-                    SpooferTickEvent {
-                        current_index: processed_count,
-                        total_games: target_count,
-                        active_batch: active_batch_info.clone(),
-                        elapsed_secs: held.as_secs(),
-                        estimated_remaining_secs: hold_duration
-                            .map_or(0, |limit| limit.saturating_sub(held).as_secs()),
-                        games_per_minute: 0.0,
-                    },
-                );
-            }
-
-            if pause_flag.load(Ordering::SeqCst) {
-                *status_lock.write().await = SpooferStatus::Paused;
-                let _ = app.emit(
-                    "spoofer_status",
-                    SpooferStatusEvent {
-                        status: SpooferStatus::Paused,
-                        message: None,
-                    },
-                );
-                log_event(
-                    &app,
-                    "warn",
-                    pick("Пауза в текущем батче.", "Paused inside the current batch."),
-                );
-                let pause_start = Instant::now();
-                resume_notify.notified().await;
-                if cancel_flag.load(Ordering::SeqCst) {
-                    break;
+                    Err(e) => log_event(app, "warn", &format!("{}: {e}", game.name)),
                 }
-                hold_start += pause_start.elapsed();
-                *status_lock.write().await = SpooferStatus::Running;
-                let _ = app.emit(
-                    "spoofer_status",
-                    SpooferStatusEvent {
-                        status: SpooferStatus::Running,
-                        message: None,
-                    },
-                );
-                log_event(
-                &app,
-                "info",
-                pick("Продолжение работы.", "Resuming."),
-            );
-            }
-
-            tokio::time::sleep(Duration::from_millis(100)).await;
-        }
-
-        // Cleanup spawned child processes and temporary files
-        for (mut child, _game, exe_path) in spawned_processes {
-            let pid = child.id();
-            force_kill_pid(pid);
-            let _ = child.kill();
-            let _ = child.wait();
-
-            let _ = fs::remove_file(&exe_path);
-            if let Some(parent) = exe_path.parent() {
-                if parent != temp_root {
-                    let _ = fs::remove_dir(parent);
+            } else {
+                match DiscordRpcSession::connect(&game.id).await {
+                    Ok(mut s) => {
+                        match s.set_activity(&game.name, stamp, std::process::id()).await {
+                            Ok(()) => {
+                                rpc.push((s, game.id.clone()));
+                                active.push(info);
+                            }
+                            Err(e) => log_event(app, "warn", &format!("{}: {e}", game.name)),
+                        }
+                    }
+                    Err(e) => log_event(app, "warn", &format!("{}: {e}", game.name)),
                 }
             }
         }
-
-        // Close RPC sessions
-        let cur_pid = std::process::id();
-        for mut session in active_rpc_sessions {
-            let _ = session.clear_activity(cur_pid).await;
-            session.close().await;
+        if active.is_empty() {
+            return Err("Ни одну активность запустить не удалось. Подробности в журнале.".into());
         }
-
-        {
-            let mut pids_guard = active_pids.lock().await;
-            pids_guard.clear();
-        }
-
-        // Record completed batch in persistent history (farm games stay available for normal runs)
-        if !is_farm && !cancel_flag.load(Ordering::SeqCst) {
-            let batch_ids: Vec<String> = current_batch.iter().map(|g| g.id.clone()).collect();
-            record_played_batch(&batch_ids);
-        }
-
-        processed_count += current_batch.len();
-
-        // Brief breather between batches to let the OS process table and Discord process watcher settle cleanly
-        if !cancel_flag.load(Ordering::SeqCst) && processed_count < target_count && !pool.is_empty() {
-            tokio::time::sleep(Duration::from_millis(500)).await;
-        }
-
-        let elapsed_secs = start_time.elapsed().as_secs();
-        let games_done = processed_count;
-        let games_per_sec = if elapsed_secs > 0 {
-            games_done as f64 / elapsed_secs as f64
+        let hold = Duration::from_secs(if farm {
+            config.farm_duration_secs.unwrap_or(3600)
         } else {
-            0.0
-        };
-        let remaining_games = target_count.saturating_sub(games_done);
-        let fallback_secs = if batch_size > 0 {
-            let batches_left = (remaining_games + batch_size - 1) / batch_size;
-            batches_left as u64 * config.hold_duration_secs
-        } else {
-            0
-        };
-        let estimated_remaining_secs = if games_per_sec > 0.0 {
-            (remaining_games as f64 / games_per_sec) as u64
-        } else {
-            fallback_secs
-        };
-
-        let _ = app.emit(
-            "spoofer_tick",
-            SpooferTickEvent {
-                current_index: processed_count,
-                total_games: target_count,
-                active_batch: Vec::new(),
-                elapsed_secs,
-                estimated_remaining_secs,
-                games_per_minute: games_per_sec * 60.0,
-            },
+            config.hold_duration_secs
+                + if config.jitter_enabled {
+                    1 + batches as u64 % 3
+                } else {
+                    0
+                }
+        });
+        log_event(
+            app,
+            "info",
+            &format!(
+                "Активны: {}",
+                active
+                    .iter()
+                    .map(|g| g.name.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
         );
-
-        if cancel_flag.load(Ordering::SeqCst) {
+        let mut held = Duration::ZERO;
+        let mut tick = Instant::now();
+        while held < hold && !cancelled(app) && !expired(start) {
+            let step = Instant::now();
+            for (child, id) in &mut children {
+                if child.0.try_wait().map_err(|e| e.to_string())?.is_some() {
+                    active.retain(|a| &a.id != id);
+                }
+            }
+            for (session, id) in &mut rpc {
+                if active.iter().any(|g| &g.id == id) {
+                    if let Err(e) = session.poll_connection().await {
+                        active.retain(|g| &g.id != id);
+                        log_event(app, "warn", &format!("RPC {id}: {e}"));
+                    }
+                }
+            }
+            if active.is_empty() {
+                break;
+            }
+            if tick.elapsed() >= Duration::from_millis(250) {
+                emit_tick(
+                    app,
+                    active.clone(),
+                    done,
+                    total,
+                    start,
+                    hold.saturating_sub(held).as_secs(),
+                );
+                tick = Instant::now();
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            // Pause holds scheduling; the current activity remains visible, as stated in UI.
+            if !paused(app) {
+                held += step.elapsed();
+            }
+        }
+        let success = held >= hold && !cancelled(app) && !expired(start);
+        let ids: Vec<_> = active.iter().map(|g| g.id.clone()).collect();
+        drop(children); // kill + reap before removing executables
+        for (mut s, _) in rpc {
+            let _ = s.clear_activity(std::process::id()).await;
+        }
+        drop(batch_dir);
+        if success && !farm {
+            record_played_batch(&ids)?;
+        }
+        if success {
+            completed += ids.len();
+        }
+        done += batch.len();
+        batches += 1;
+        emit_tick(app, Vec::new(), done, total, start, 0);
+        if farm {
             break;
         }
+        wait(app, Duration::from_secs(1), start).await;
     }
-
-    cleanup_temp_dir(&temp_root);
-
-    let final_status = if cancel_flag.load(Ordering::SeqCst) {
-        SpooferStatus::Idle
-    } else {
-        SpooferStatus::Finished
-    };
-
-    *status_lock.write().await = final_status;
-    let _ = app.emit(
-        "spoofer_status",
-        SpooferStatusEvent {
-            status: final_status,
-            message: None,
-        },
-    );
-
-    let total_elapsed = start_time.elapsed().as_secs();
-    if is_farm {
-        let message = if is_russian() {
-            format!("Фарм завершён: {} игр, {} сек.", processed_count, total_elapsed)
-        } else {
-            format!("Farm finished: {} games, {} sec.", processed_count, total_elapsed)
-        };
-        log_event(&app, "info", &message);
-    } else if final_status == SpooferStatus::Finished {
-        let message = if is_russian() {
-            format!(
-                "Эмуляция {} игр успешно завершена за {} сек! Прогресс сохранен в истории.",
-                processed_count, total_elapsed
-            )
-        } else {
-            format!(
-                "Spoofed {} games in {} sec! Progress saved to history.",
-                processed_count, total_elapsed
-            )
-        };
-        log_event(&app, "success", &message);
-    } else {
-        let message = if is_russian() {
-            format!(
-                "Работа остановлена. Обработано {} игр за {} сек.",
-                processed_count, total_elapsed
-            )
-        } else {
-            format!(
-                "Stopped. Processed {} games in {} sec.",
-                processed_count, total_elapsed
-            )
-        };
-        log_event(&app, "info", &message);
+    emit_tick(app, Vec::new(), done, total, start, 0);
+    log_event(app,"info",&format!("Сессия завершена. Полностью выдержали интервал: {completed}. Это локальная история, а не подтверждение значков Discord."));
+    Ok(())
+}
+#[cfg(test)]
+mod tests {
+    use super::*;
+    fn game() -> SpoofableGame {
+        SpoofableGame {
+            id: "1".into(),
+            name: "Test".into(),
+            rel_path: Some("bin/test-game".into()),
+            arguments: None,
+            icon_hash: None,
+            method: SpoofMethod::Process,
+        }
+    }
+    #[test]
+    fn helper_uses_basename_and_dies_on_drop() {
+        let d = tempfile::tempdir().unwrap();
+        let c = spawn_helper(d.path(), &game()).unwrap();
+        let pid = c.0.id();
+        std::thread::sleep(Duration::from_millis(100));
+        assert_eq!(
+            fs::read_to_string(format!("/proc/{pid}/comm"))
+                .unwrap()
+                .trim(),
+            "test-game"
+        );
+        assert!(fs::read_to_string(format!("/proc/{pid}/status"))
+            .unwrap()
+            .contains("NoNewPrivs:\t1"));
+        // Discord must be able to inspect exe, not just comm.
+        assert!(fs::read_link(format!("/proc/{pid}/exe")).is_ok());
+        drop(c);
+        assert!(!Path::new(&format!("/proc/{pid}")).exists());
+    }
+    #[test]
+    fn rejects_cache_traversal_at_spawn() {
+        let d = tempfile::tempdir().unwrap();
+        let mut g = game();
+        g.rel_path = Some("../escape".into());
+        assert!(spawn_helper(d.path(), &g).is_err());
     }
 }

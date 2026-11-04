@@ -1,77 +1,45 @@
+use crate::security::{atomic_write, data_dir, read_json, valid_id, MAX_HISTORY};
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
-use std::fs;
-use std::path::PathBuf;
-
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
-pub struct SpoofHistory {
-    pub played_ids: HashSet<String>,
+use std::sync::Mutex;
+static HISTORY_LOCK: Mutex<()> = Mutex::new(());
+#[derive(Serialize, Deserialize, Default)]
+struct History {
+    played_ids: HashSet<String>,
 }
-
-/// Per-user data folder for mimic (history, cached game database).
-pub fn get_app_dir() -> PathBuf {
-    #[cfg(windows)]
-    let base_dir = std::env::var("APPDATA")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| std::env::temp_dir());
-
-    #[cfg(target_os = "macos")]
-    let base_dir = std::env::var("HOME")
-        .map(|h| PathBuf::from(h).join("Library").join("Application Support"))
-        .unwrap_or_else(|_| std::env::temp_dir());
-
-    #[cfg(all(not(windows), not(target_os = "macos")))]
-    let base_dir = std::env::var("XDG_CONFIG_HOME")
-        .map(PathBuf::from)
-        .or_else(|_| std::env::var("HOME").map(|h| PathBuf::from(h).join(".config")))
-        .unwrap_or_else(|_| std::env::temp_dir());
-
-    let app_dir = base_dir.join("mimic");
-    let _ = fs::create_dir_all(&app_dir);
-    app_dir
-}
-
-pub fn get_history_path() -> PathBuf {
-    get_app_dir().join("history.json")
-}
-
-pub fn load_history() -> HashSet<String> {
-    let path = get_history_path();
-    if !path.exists() {
-        return HashSet::new();
+fn load() -> Result<HashSet<String>, String> {
+    let path = data_dir()?.join("history.json");
+    if !path.try_exists().map_err(|e| e.to_string())? {
+        return Ok(HashSet::new());
     }
-
-    match fs::read_to_string(&path) {
-        Ok(data) => match serde_json::from_str::<SpoofHistory>(&data) {
-            Ok(hist) => hist.played_ids,
-            Err(_) => HashSet::new(),
-        },
-        Err(_) => HashSet::new(),
+    let h: History =
+        serde_json::from_str(&read_json(&path, 4 * 1024 * 1024)?).map_err(|e| e.to_string())?;
+    if h.played_ids.len() > MAX_HISTORY || h.played_ids.iter().any(|id| !valid_id(id)) {
+        return Err("Invalid history".into());
     }
+    Ok(h.played_ids)
 }
-
-pub fn save_history(played_ids: &HashSet<String>) -> Result<(), String> {
-    let path = get_history_path();
-    let hist = SpoofHistory {
-        played_ids: played_ids.clone(),
-    };
-    let json = serde_json::to_string_pretty(&hist).map_err(|e| e.to_string())?;
-    fs::write(&path, json).map_err(|e| e.to_string())?;
-    Ok(())
+pub fn load_history() -> Result<HashSet<String>, String> {
+    let _g = HISTORY_LOCK.lock().map_err(|e| e.to_string())?;
+    load()
 }
-
-pub fn record_played_batch(new_ids: &[String]) {
-    let mut current = load_history();
-    for id in new_ids {
-        current.insert(id.clone());
+pub fn record_played_batch(ids: &[String]) -> Result<usize, String> {
+    if ids.len() > MAX_HISTORY || ids.iter().any(|id| !valid_id(id)) {
+        return Err("Invalid history IDs".into());
     }
-    let _ = save_history(&current);
+    let _g = HISTORY_LOCK.lock().map_err(|e| e.to_string())?;
+    let mut all = load()?;
+    let before = all.len();
+    all.extend(ids.iter().cloned());
+    if all.len() > MAX_HISTORY {
+        return Err("History limit exceeded".into());
+    }
+    let added = all.len() - before;
+    let bytes = serde_json::to_vec(&History { played_ids: all }).map_err(|e| e.to_string())?;
+    atomic_write(&data_dir()?.join("history.json"), &bytes)?;
+    Ok(added)
 }
-
 pub fn clear_history() -> Result<(), String> {
-    let path = get_history_path();
-    if path.exists() {
-        fs::remove_file(path).map_err(|e| e.to_string())?;
-    }
-    Ok(())
+    let _g = HISTORY_LOCK.lock().map_err(|e| e.to_string())?;
+    atomic_write(&data_dir()?.join("history.json"), br#"{"played_ids":[]}"#)
 }

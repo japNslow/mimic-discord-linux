@@ -1,10 +1,12 @@
 {
   "$schema": "https://schema.tauri.app/config/2/capability",
   "identifier": "default",
-  "description": "Default capabilities for mimic",
-  "windows": ["main"],
+  "description": "Only local event subscriptions; no shell, file or HTTP access from the webview.",
+  "windows": [
+    "main"
+  ],
   "permissions": [
-    "core:default",
-    "core:event:default"
+    "core:event:allow-listen",
+    "core:event:allow-unlisten"
   ]
 }

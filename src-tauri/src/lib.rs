@@ -1,15 +1,28 @@
+#[cfg(not(target_os = "linux"))]
+compile_error!("Mimic Linux supports Linux only");
 pub mod commands;
 pub mod discord;
 pub mod history;
 pub mod i18n;
 pub mod rpc;
+pub mod security;
 pub mod spoofer;
 pub mod state;
-
 use state::AppState;
-
-#[cfg_attr(mobile, tauri::mobile_entry_point)]
+use tauri::Manager;
 pub fn run() {
+    if unsafe { libc::geteuid() } == 0 {
+        eprintln!("Mimic Linux: запуск от root запрещён.");
+        std::process::exit(1);
+    }
+    let dir = security::data_dir().unwrap_or_else(|e| {
+        eprintln!("Mimic Linux: {e}");
+        std::process::exit(1)
+    });
+    let _instance = security::InstanceLock::acquire(&dir).unwrap_or_else(|e| {
+        eprintln!("Mimic Linux: {e}");
+        std::process::exit(1)
+    });
     tauri::Builder::default()
         .manage(AppState::new())
         .invoke_handler(tauri::generate_handler![
@@ -24,9 +37,14 @@ pub fn run() {
             commands::clear_history,
             commands::export_history,
             commands::import_history,
-            commands::open_external_url,
-            commands::set_language,
+            commands::set_language
         ])
-        .run(tauri::generate_context!())
-        .expect("error while running mimic desktop application");
+        .build(tauri::generate_context!())
+        .expect("Cannot build Mimic Linux")
+        .run(|app, event| {
+            if matches!(event, tauri::RunEvent::Exit) {
+                let _ =
+                    tauri::async_runtime::block_on(commands::shutdown(&app.state::<AppState>()));
+            }
+        });
 }

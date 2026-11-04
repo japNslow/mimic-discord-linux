@@ -1,110 +1,119 @@
-# mimic
+# Mimic Discord Linux
 
-<div align="center">
-  <img src="mimic.png" width="128" height="128" alt="mimic logo" />
-  <p><strong>Lightweight desktop Discord game activity spoofer & badge booster</strong></p>
-  <p>Boost your Discord profile <b>Game Variety (Универсал)</b> and <b>Game Time (Время в играх)</b> badges natively on Windows & Linux.</p>
-  <br />
-  <img src="proof.png" width="300" alt="Mythic Game Variety Badge Proof (9,837 games)" />
-  <p><sub>Mythic «Универсал» badge unlocked with 9,837 games via mimic</sub></p>
-</div>
+Linux-форк [Timon2306/mimic-discord](https://github.com/Timon2306/mimic-discord), с новым русским интерфейсом и переработанной логикой запуска. Основа: upstream `58413fe` (v1.3.1). MIT; оригинальное уведомление об авторских правах сохранено в LICENSE.
 
----
+![Предпросмотр интерфейса, без подключения к Discord](docs/preview.png)
 
-## ✨ Features
+## Быстрый запуск
 
-- **🏆 Game Variety Badge Booster**: Rapidly cycles through verified Discord titles in parallel batches (e.g. 8 games with 15s hold). Tested and proven to unlock the Mythic **Универсал** badge (9,800+ games).
-- **⏱️ Game Time Multiplier**: Running multiple games concurrently multiplies your Discord gameplay tracking hours (e.g. 8 games × 5 hours = 40 hours credited).
-- **🐧 Multiplatform Support**: Runs natively on both **Windows** (Win32 dummy process window emulation) and **Linux** (`prctl`/`/proc/self/comm` emulation). Note: Discord's database is heavily Windows-oriented — on Linux only **8** games have a native executable, see [Known Limitations](#-disclaimer--known-limitations).
-- **🛡️ 100% Safe & Native**: Zero token extraction, zero memory injection, zero Discord client modifications. Discord naturally detects running games via official OS process inspection APIs.
-- **⚡ Background Process Emulation**: Lightweight dummy engine creating legitimate application processes without stealing focus or interrupting your work.
-- **🧹 Zero Residual Disk Footprint**: Instant per-batch cleanup ensuring temporary files are immediately removed from disk, preventing Discord settings cache bloat.
-- **💾 Smart History & State**: Persistent cache (`history.json`) skips already spoofed games across sessions so you never repeat entries.
+Сначала установите системные зависимости из раздела «Сборка из исходников», затем:
 
----
-
-## 🎮 How It Works
-
-Discord tracks two badges for desktop gamers:
-
-1. **Game Variety (Разные игры — Универсал)**:
-   - Tracks unique PC titles played over time.
-   - Cycles through Discord's official database of 10,000+ detectable applications.
-   - Recommended setting: **Batch Size: 8**, **Hold Duration: 15s**.
-   - *Note: Discord servers process badge telemetry in batch intervals (up to 24h delay).*
-
-2. **Game Time (Время в играх)**:
-   - Tracks total playtime hours.
-   - Running parallel dummy processes multiplies tracked hours (e.g. 8x boost).
-   - Use the **Hour farm** tab: pick up to 20 games and they keep running without rotating until you stop them or the timer ends.
-
----
-
-## 🛠️ Tech Stack
-
-- **Backend**: Rust, [Tauri v2](https://v2.tauri.app/), Tokio, Reqwest, Windows API (`windows-sys`), Linux (`libc`)
-- **Frontend**: React, TypeScript, Vite, Tailwind CSS
-
----
-
-## 🚀 Quick Start
-
-### Prerequisites
-
-- [Node.js](https://nodejs.org/) (v18+)
-- [Rust](https://rustup.rs/) (v1.75+)
-- [Discord Desktop Client](https://discord.com/)
-
-### Installation & Run
-
-```bash
-# Clone the repository
-git clone https://github.com/Timon2306/mimic-discord.git
-cd mimic-discord
-
-# Install dependencies
-npm install
-
-# Run in development mode
-npm run tauri dev
+```sh
+git clone https://github.com/japNslow/mimic-discord-linux.git
+cd mimic-discord-linux
+npm ci --ignore-scripts
+npm run linux:portable
+./run.sh
 ```
 
-### Production Build
+Запускайте обычным пользователем, **без sudo**. Собранный файл находится в `src-tauri/target/release/mimic-linux`. Это динамически связанный Linux ELF; ему нужны GTK 3 и WebKitGTK 4.1. Сборка на одном дистрибутиве не гарантирует работу на другом. Проверить библиотеки: `ldd src-tauri/target/release/mimic-linux`.
 
-```bash
-# Build standalone installer & executable
-npm run tauri build
+Для локального архива с бинарником и исходниками: `npm run linux:package`. После распаковки архива готовой сборки запускайте `./mimic-linux` или `./run.sh`. Готовые файлы сборки не хранятся в Git.
+
+1. Откройте Discord Desktop, войдите в него обычным способом.
+2. В Discord разрешите отображение игровой активности.
+3. В Mimic нажмите **«Загрузить базу игр»**. Автоматических запросов к базе нет.
+4. Для последовательной смены оставьте **«Смена игр»**, задайте интервал и нажмите **«Запустить сессию»**.
+5. Для фиксированного набора выберите до четырёх игр в **«Библиотеке»**, затем **«Перейти к сессии»**.
+6. **«Остановить»** и обычное закрытие окна завершают собственные процессы приложения.
+
+Пауза приостанавливает таймер и смену игр; уже запущенная активность остаётся до остановки. Максимум — четыре помощника/соединения и восемь часов на сессию, включая время на паузе. Фиксированный набор по умолчанию работает один час.
+
+## Что умеет
+
+- Нативные Linux-процессы с именами из публичной базы Discord; запускается только встроенный спящий помощник.
+- Последовательная смена игр либо фиксированный набор, журнал и таймер.
+- Локальная история полностью выдержанных интервалов; пропуск истории при следующем запуске, JSON-импорт и экспорт.
+- Отдельно включаемый экспериментальный Discord IPC/RPC для приложений без Linux-файла.
+- Кеш базы на 12 часов. При сетевой ошибке можно использовать проверенный сохранённый кеш.
+
+Количество нативных игр определяется текущей базой Discord; в интерфейсе нет выдуманного списка или обещания поддержки Windows-игр через Wine. Discord в браузере не имеет нужного локального IPC. Для Discord Flatpak ищем IPC также в `$XDG_RUNTIME_DIR/app/com.discordapp.Discord/`; доступ зависит от настроек контейнера, которые приложение само не меняет. Символические ссылки на IPC намеренно не принимаются.
+
+**История означает только локальное выполнение интервала.** Она не доказывает, что Discord показал игру или начислил часы/значки. RPC ACK подтверждает принятие команды, а не зачёт наград. Несколько RPC-соединений не гарантируют несколько одновременных видимых игр. Имитация активности — сторонний сценарий; гарантировать отсутствие санкций аккаунту невозможно.
+
+## Что изменено ради защиты
+
+- Запрет запуска от root, блокировка второго экземпляра.
+- Никаких токенов, паролей, self-bot, модификации клиента или внедрения в память Discord.
+- Проверка путей и идентификаторов из сети **и кеша**, лимиты входных данных.
+- Случайные рабочие каталоги с правами `0700` внутри отдельной папки пользователя. Файлы истории и кеша `0600`; атомарная запись, отказ от небезопасных файлов/символических ссылок.
+- Собственные `Child`-дескрипторы, `kill + wait`, без остановки по сохранённым PID. Parent-death signal и `no_new_privs` для помощников; очищенное окружение.
+- Проверка владельца Unix-сокета и UID собеседника, строгий READY/ACK, лимиты кадров и тайм-ауты RPC.
+- HTTPS с тайм-аутами и лимитом 32 МБ, без редиректов и автоматических повторов на 429.
+- Веб-интерфейс без внешних шрифтов, аналитики, CDN и сетевых разрешений. Включён CSP; доступ к событиям ограничен подпиской/отпиской.
+- Нет автозапуска, фонового сервиса, автообновления или автоматической публикации релизов.
+
+Подробности и оставшиеся ограничения: [SECURITY.md](SECURITY.md). Результаты разбора исходника: [AUDIT.md](AUDIT.md).
+
+## Данные
+
+Папка: `$XDG_STATE_HOME/mimic-linux`, либо `$HOME/.local/state/mimic-linux`:
+
+- `games.json` — проверенный кеш базы;
+- `history.json` — идентификаторы локально обработанных игр;
+- `instance.lock` — блокировка экземпляра;
+- `session-*` — временные каталоги с встроенными помощниками.
+
+Старую папку upstream `~/.config/mimic` не читаем и не меняем. Для переноса используйте JSON-экспорт и импорт. Журнал остаётся в памяти. Интерфейс не сохраняет настройки между перезапусками, поэтому RPC каждый раз выключен.
+
+При штатной остановке рабочие каталоги удаляются. После SIGKILL/сбоя питания они могут остаться, но дочерние процессы завершаются при смерти родителя. Автоматически сканировать и удалять старые каталоги приложение не пытается. При необходимости удалите только `session-*` в папке Mimic после остановки приложения. Не меняйте каталог данных и его предков во время работы.
+
+## Сборка из исходников
+
+Нужны Node.js 22+ с npm, стабильный Rust, GTK 3 и WebKitGTK 4.1.
+
+Ubuntu/Debian (названия пакетов зависят от выпуска):
+
+```sh
+sudo apt install build-essential pkg-config libgtk-3-dev libwebkit2gtk-4.1-dev librsvg2-dev patchelf
 ```
 
-Compiled standalone binaries:
-- Windows: `src-tauri/target/release/bundle/nsis/` & `src-tauri/target/release/mimic.exe`
-- Linux: `src-tauri/target/release/bundle/appimage/` & `src-tauri/target/release/bundle/deb/`
+Arch Linux:
 
-### Release assets
+```sh
+sudo pacman -S --needed base-devel rust nodejs npm webkit2gtk-4.1 gtk3 librsvg
+```
 
-Every release ships four files:
+В каталоге проекта:
 
-| Platform | File | Notes |
-| --- | --- | --- |
-| Windows | `mimic_<version>_x64-setup.exe` | NSIS installer (Start Menu + desktop shortcut) |
-| Windows | `mimic_<version>_x64_portable.exe` | Single portable exe — download and run, no installation |
-| Linux | `mimic_<version>_amd64.AppImage` | Portable, `chmod +x` and run |
-| Linux | `mimic_<version>_amd64.deb` | Debian/Ubuntu package |
+```sh
+npm ci --ignore-scripts
+npm run check
+npm run linux:portable
+```
 
-The portable Windows build is the very same binary as the installed one — it just is not wrapped in an installer. It still needs the WebView2 runtime, which ships with Windows 10/11 by default.
+Результат: `src-tauri/target/release/mimic-linux`. Для разработки: `npm run tauri dev`. Только веб-предпросмотр: `npm run dev` (запуск процессов в нём отключён).
 
----
+Установочный `.deb` можно собрать командой `npm run linux:build`. Для совместимости с Ubuntu собирайте пакет на Ubuntu: сборка на Arch не обеспечивает совместимость со старыми glibc/WebKitGTK. Workflow CI настроен собирать Linux-бинарник и `.deb` на Ubuntu 22.04 и сохраняет их как артефакты, без публикации релиза. AppImage — опциональная сборка через `npm run tauri -- build --bundles appimage`, требующая инструментов упаковки.
 
-## ⚠️ Disclaimer & Known Limitations
+Проверка интерфейса (при работающем `npm run dev` и установленном Playwright):
 
-- **Badge results are not guaranteed.** Discord decides what counts, so going past the verified numbers below may not progress the badge any further.
-- **Tested on Windows only**, with Discord games tracked up to **~10,000 games in the badge** (Mythic «Универсал»).
-- **Linux: native mode covers only 8 games.** Discord's public detectable database contains just eight Linux executables — Hearts of Iron IV, Factorio, Throne of Lies, VA-11 HALL-A, Fields of Mistria, CS:GO, Move or Die and Terraria — so process-based spoofing cannot go past them. Wine/Proton does not help: those Windows titles exist only as `win32` entries, and the Linux Discord client does not match their processes. The remaining ~24,900 titles are available only through the beta Discord RPC mode, which Discord may not credit to your profile at all.
-- A target of **24,000 games is unverified** — it may work, may be throttled, or may have no effect at all.
-- Game activity spoofing is not officially supported by Discord. Use it at your own risk.
+```sh
+node tests/ui.mjs
+```
 
----
+Опциональные `PLAYWRIGHT_MODULE` и `CHROMIUM_PATH` позволяют использовать уже установленный тестовый браузер. Веб-проверка не подключается к аккаунту Discord.
 
-## 📄 License
+## Проверки
 
-This project is licensed under the [MIT License](LICENSE).
+Локальная проверка версии 0.1.0 выполнена на Arch Linux x86_64.
+
+- Production-сборка TypeScript/Vite.
+- Реальный публичный каталог Discord: из 25 141 записи парсер принял 25 140, включая 8 Linux-игр; одна запись отфильтрована проверками (снимок на момент проверки; количество может меняться). Опциональный тест `downloaded_public_catalog` запускается отдельно через `MIMIC_CATALOG_FIXTURE`.
+- 20 тестов Rust: пути, кеш, права/ссылки, блокировка экземпляра, backend-лимиты, ошибки/тайм-ауты/heartbeat RPC, собственный helper и его завершение.
+- Интерфейс: навигация, пустые состояния, переключение RPC, отсутствие внешних запросов, размеры окна 1180/860/650/390 px.
+- Нативный запуск, отказ второму экземпляру и завершение helper при SIGKILL родителя.
+- `cargo clippy --all-targets -- -D warnings`: без замечаний.
+- `npm audit`: известных уязвимостей не обнаружено на момент проверки.
+
+Реальный зачёт активности и наград Discord не проверен. Это не независимый аудит безопасности и не обещание абсолютной защиты.
