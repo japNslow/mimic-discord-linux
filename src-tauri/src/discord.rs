@@ -2,7 +2,9 @@ use crate::security::{atomic_write, data_dir, read_json, safe_relative, valid_id
 use serde::{Deserialize, Serialize};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tauri::AppHandle;
-const URL: &str = "https://discord.com/api/v9/applications/detectable";
+const URL: &str = "https://cdn.discordapp.com/detectables/games-v1.json";
+// Version 1 incorrectly classified every Windows-only rule as RPC on Linux.
+const CACHE_VERSION: u32 = 2;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SpoofMethod {
@@ -39,6 +41,8 @@ struct RawExe {
     os: String,
     #[serde(default)]
     is_launcher: bool,
+    #[serde(default)]
+    arguments: Option<String>,
 }
 #[derive(Deserialize)]
 struct RawApp {
@@ -49,6 +53,8 @@ struct RawApp {
 }
 #[derive(Serialize, Deserialize)]
 struct Cache {
+    #[serde(default)]
+    version: u32,
     fetched_at: u64,
     games: Vec<SpoofableGame>,
 }
@@ -61,7 +67,8 @@ fn now() -> u64 {
 fn cached() -> Option<Cache> {
     let p = data_dir().ok()?.join("games.json");
     let cache: Cache = serde_json::from_str(&read_json(&p, MAX_JSON).ok()?).ok()?;
-    if cache.games.is_empty()
+    if cache.version != CACHE_VERSION
+        || cache.games.is_empty()
         || cache.games.len() > 100_000
         || cache.games.iter().any(|g| !g.validate())
     {
@@ -82,8 +89,18 @@ fn parse_games(bytes: &[u8]) -> Result<Vec<SpoofableGame>, String> {
             let rel = app
                 .executables
                 .iter()
-                .filter(|e| e.os == "linux" && safe_relative(&e.name).is_some())
-                .min_by_key(|e| e.is_launcher)
+                // Discord's current Linux observer receives executable rules
+                // from every OS. A Linux ELF named overwatch.exe is detectable
+                // by that observer; no Wine, RPC or client modification is used.
+                // Prefer a Linux name, otherwise a Windows name. Skip launchers
+                // and argument-specific rules we cannot faithfully reproduce.
+                .filter(|e| {
+                    matches!(e.os.as_str(), "linux" | "win32")
+                        && !e.is_launcher
+                        && e.arguments.as_deref().is_none_or(str::is_empty)
+                        && safe_relative(&e.name).is_some()
+                })
+                .min_by_key(|e| e.os != "linux")
                 .map(|e| e.name.clone());
             let game = SpoofableGame {
                 id: app.id,
@@ -157,6 +174,7 @@ pub async fn load_games(
     match fetch().await {
         Ok(games) => {
             let bytes = serde_json::to_vec(&Cache {
+                version: CACHE_VERSION,
                 fetched_at: now(),
                 games: games.clone(),
             })
@@ -203,11 +221,44 @@ pub fn is_discord_running() -> bool {
 mod tests {
     use super::*;
     #[test]
-    fn linux_only_no_external_arguments() {
-        let games=parse_games(br#"[{"id":"1","name":"Linux game","executables":[{"name":"bin/game","os":"linux","arguments":"--anything"}]},{"id":"2","name":"Windows","executables":[{"name":"game.exe","os":"win32"}]}]"#).unwrap();
+    fn windows_names_are_linux_process_candidates() {
+        let games=parse_games(br#"[{"id":"1","name":"Linux game","executables":[{"name":"bin/game","os":"linux"}]},{"id":"2","name":"Windows","executables":[{"name":"game/game.exe","os":"win32"}]}]"#).unwrap();
         assert_eq!(games[0].method, SpoofMethod::Process);
         assert!(games[0].arguments.is_none());
-        assert_eq!(games[1].method, SpoofMethod::Rpc);
+        assert_eq!(games[1].method, SpoofMethod::Process);
+        assert_eq!(games[1].rel_path.as_deref(), Some("game/game.exe"));
+        assert!(games[1].arguments.is_none());
+    }
+    #[test]
+    fn prefers_linux_name_and_skips_launchers_or_required_arguments() {
+        let games=parse_games(br#"[
+          {"id":"1","name":"Native first","executables":[{"name":"a.exe","os":"win32"},{"name":"native","os":"linux"}]},
+          {"id":"2","name":"Launcher","executables":[{"name":"launcher.exe","os":"win32","is_launcher":true},{"name":"real.exe","os":"win32"}]},
+          {"id":"3","name":"Needs arguments","executables":[{"name":"runtime.exe","os":"win32","arguments":"--game test"}]},
+          {"id":"4","name":"Mac only","executables":[{"name":"game.app","os":"darwin"}]}
+        ]"#).unwrap();
+        assert_eq!(games[0].rel_path.as_deref(), Some("native"));
+        assert_eq!(games[1].rel_path.as_deref(), Some("real.exe"));
+        assert_eq!(games[2].method, SpoofMethod::Rpc);
+        assert_eq!(games[3].method, SpoofMethod::Rpc);
+    }
+    #[test]
+    fn rejects_unsafe_windows_names() {
+        let games = parse_games(
+            br#"[
+          {"id":"1","name":"Traversal","executables":[{"name":"../game.exe","os":"win32"}]},
+          {"id":"2","name":"Absolute","executables":[{"name":"/tmp/game.exe","os":"win32"}]}
+        ]"#,
+        )
+        .unwrap();
+        assert!(games
+            .iter()
+            .all(|g| g.method == SpoofMethod::Rpc && g.rel_path.is_none()));
+    }
+    #[test]
+    fn legacy_cache_cannot_hide_new_process_candidates() {
+        let old: Cache = serde_json::from_str(r#"{"fetched_at":1,"games":[]}"#).unwrap();
+        assert_ne!(old.version, CACHE_VERSION);
     }
     #[test]
     fn rejects_poisoned_cache_path() {
@@ -236,16 +287,19 @@ mod tests {
         let bytes = std::fs::read(path).unwrap();
         assert!(bytes.len() <= MAX_JSON as usize);
         let games = parse_games(&bytes).unwrap();
-        let native = games
+        let processes = games
             .iter()
             .filter(|g| g.method == SpoofMethod::Process)
             .count();
-        assert!(native > 0);
+        assert!(
+            processes > 1_000,
+            "Expected the expanded catalog, not only the 8 Linux-labelled entries"
+        );
         assert!(games.iter().all(SpoofableGame::validate));
         println!(
-            "Public catalog parsed: {} valid applications, {} Linux games",
+            "Public catalog parsed: {} valid applications, {} process candidates",
             games.len(),
-            native
+            processes
         );
     }
 }

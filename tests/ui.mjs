@@ -38,7 +38,7 @@ console.log('UI: navigation, empty states, RPC opt-in, disabled preview controls
 const native=await browser.newPage({viewport:{width:1180,height:850}});
 await native.addInitScript(()=>{
  const callbacks=new Map(),events=new Map();let next=1;
- const sample=[{id:'123',name:'Test Linux',method:'process',rel_path:'test-linux'},{id:'456',name:'Test RPC',method:'rpc',rel_path:null}];
+ const sample=[{id:'123',name:'Test Linux',method:'process',rel_path:'test-linux'},{id:'456',name:'Test RPC',method:'rpc',rel_path:null},{id:'789',name:'Overwatch',method:'process',rel_path:'overwatch.exe'}];
  window.testCommands=[];
  const emit=(event,payload)=>{for(const [id,fn]of events){if(fn.event===event)callbacks.get(fn.handler)?.({event,id,payload});}};
  window.__TAURI_EVENT_PLUGIN_INTERNALS__={unregisterListener:(_event,id)=>events.delete(id)};
@@ -72,11 +72,13 @@ const config=commands.find(c=>c.cmd==='start_spoofer').args.config;
 assert.equal(config.beta_enabled,false);assert.equal(config.spoof_mode,'process_only');assert.equal(config.batch_size,1);
 assert(commands.some(c=>c.cmd==='pause_spoofer'));assert(commands.some(c=>c.cmd==='resume_spoofer'));assert(commands.some(c=>c.cmd==='stop_spoofer'));
 await native.getByRole('button',{name:'Библиотека',exact:false}).click();
+await native.getByRole('button',{name:'Процессы · 2',exact:true}).waitFor();
 await native.getByRole('button',{name:'Выбрать Test Linux'}).click();
+await native.getByRole('button',{name:'Выбрать Overwatch'}).click();
 await native.getByRole('button',{name:'Перейти к сессии'}).click();
 await native.getByRole('button',{name:'Запустить сессию',exact:true}).click();
 const farmCommand=await native.evaluate(()=>window.testCommands.filter(c=>c.cmd==='start_spoofer').at(-1));
-assert.deepEqual(farmCommand.args.config.farm_game_ids,['123']);
+assert.deepEqual(farmCommand.args.config.farm_game_ids,['123','789']);
 await native.getByRole('button',{name:'Остановить',exact:true}).click();
 console.log('UI command bridge: native defaults, load/start/pause/resume/stop and fixed game selection — passed (mock backend).');
 await browser.close();

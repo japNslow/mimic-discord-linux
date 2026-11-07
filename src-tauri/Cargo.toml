@@ -1,6 +1,6 @@
 [package]
 name = "mimic-linux"
-version = "0.1.0"
+version = "0.2.0"
 description = "Local Discord activity utility for Linux"
 authors = ["Mimic Linux contributors", "Timon2306 (upstream)"]
 license = "MIT"

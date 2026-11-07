@@ -1,0 +1,40 @@
+{
+  "ruleCount": 10470,
+  "rpcUsed": false,
+  "wineUsed": false,
+  "windowsCreated": false,
+  "serverCreditTested": false,
+  "samples": [
+    {
+      "name": "Factorio",
+      "executable": "factorio.exe",
+      "expectedApplicationId": "358422126602223616",
+      "detectedApplicationId": "358422126602223616",
+      "matched": true
+    },
+    {
+      "name": "Overwatch",
+      "executable": "overwatch.exe",
+      "expectedApplicationId": "356875221078245376",
+      "detectedApplicationId": "356875221078245376",
+      "matched": true
+    },
+    {
+      "name": "ELDEN RING",
+      "executable": "game/eldenring.exe",
+      "expectedApplicationId": "1402418436809953330",
+      "detectedApplicationId": "1402418436809953330",
+      "matched": true
+    },
+    {
+      "name": "Rocket League",
+      "executable": "rocketleague.exe",
+      "expectedApplicationId": "356877880938070016",
+      "detectedApplicationId": "356877880938070016",
+      "matched": true
+    }
+  ],
+  "nativeModuleSha256": "fedf41fd98bd284e48e888b9d21a060814311217cfe836ed919e675e7208084a",
+  "catalogSha256": "20353517f727b6b3e8d3bb68c0e94dfa3f7ac39a5f1babe0d7f1ae9f5f930e81",
+  "helperSha256": "95c5e9f59d545dc42506469e486ada61b5d5c27fdcf942eabf328fd134401f8a"
+}

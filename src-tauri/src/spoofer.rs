@@ -417,4 +417,24 @@ mod tests {
         g.rel_path = Some("../escape".into());
         assert!(spawn_helper(d.path(), &g).is_err());
     }
+    #[test]
+    fn windows_name_runs_our_linux_helper() {
+        let d = tempfile::tempdir().unwrap();
+        let mut g = game();
+        g.rel_path = Some("game/eldenring.exe".into());
+        let c = spawn_helper(d.path(), &g).unwrap();
+        let pid = c.0.id();
+        std::thread::sleep(Duration::from_millis(100));
+        let path = fs::read_link(format!("/proc/{pid}/exe")).unwrap();
+        assert_eq!(path, d.path().join("game/eldenring.exe"));
+        assert_eq!(&fs::read(&path).unwrap()[..4], b"\x7fELF");
+        assert_eq!(
+            fs::read_to_string(format!("/proc/{pid}/comm"))
+                .unwrap()
+                .trim(),
+            "eldenring.exe"
+        );
+        drop(c);
+        assert!(!Path::new(&format!("/proc/{pid}")).exists());
+    }
 }
